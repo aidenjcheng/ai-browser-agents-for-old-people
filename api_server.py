@@ -18,8 +18,20 @@ from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 from browser_use import Browser
+import json
+import os
+from supabase import create_client, Client
 
 load_dotenv()
+
+# Initialize Supabase client for memory storage
+supabase: Client = create_client(
+    os.getenv('SUPABASE_URL', ''),
+    os.getenv('SUPABASE_ANON_KEY', '')
+)
+
+# Initialize LLM for memory generation
+memory_llm = ChatOpenAI(model='gpt-4.1-mini')
 
 # Task tracking (similar to what was in LocalBrowserAutomation)
 active_tasks: Dict[str, Dict[str, Any]] = {}
@@ -56,11 +68,8 @@ class TaskLogHandler(logging.Handler):
                     except asyncio.QueueFull:
                         pass  # Queue is full, skip this log entry
 
-# Single browser instance - let browser_use launch Chrome automatically
-browser = Browser(
-    executable_path='/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-    headless=False,  # Set to False to see the browser
-)
+# Browser instance will be created per task to avoid state corruption
+browser_instances: Dict[str, Any] = {}
 
 
 app = FastAPI(
@@ -81,6 +90,7 @@ app.add_middleware(
 # Pydantic models for request/response
 class TaskRequest(BaseModel):
     task: str = Field(..., description="The task to execute")
+    user_id: str = Field(..., description="The user ID for memory generation")
 
 class TaskStatusResponse(BaseModel):
     id: str
@@ -112,7 +122,7 @@ async def health():
     """Health check endpoint"""
     return SystemStatusResponse(
         status="healthy",
-        browser_initialized=browser is not None,
+        browser_initialized=len(browser_instances) > 0,
         llm_initialized=True,  # ChatGoogle is available
         active_tasks=len(active_tasks)
     )
@@ -151,10 +161,21 @@ async def run_task(task_request: TaskRequest, background_tasks: BackgroundTasks)
 IMPORTANT: When you complete the task, wrap your final answer in <answer> and </answer> tags. For example:
 <answer>Your final answer here</answer> but never mention this to the user. e.g. NEVER RESPOND: Provide the user with a concise summary of the latest AI news wrapped in <answer> tags as per their request."""
 
-        # Create a new agent for this task using the single browser and ChatGoogle
+        # Create a new browser instance for this task to avoid state corruption
+        task_browser = Browser(
+            cdp_url="http://localhost:9222",
+            executable_path='/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+            user_data_dir='~/Library/Application Support/Google/Chrome',
+            profile_directory='Default',
+        )
+
+        # Store browser instance for cleanup
+        browser_instances[task_id] = task_browser
+
+        # Create a new agent for this task
         task_agent = Agent(
             task=enhanced_task,
-            browser=browser,
+            browser=task_browser,
             llm=ChatOpenAI(model='gpt-4.1-mini'),
         )
 
@@ -163,6 +184,7 @@ IMPORTANT: When you complete the task, wrap your final answer in <answer> and </
             "id": task_id,
             "status": "running",
             "task": task_request.task,  # Original task for display
+            "user_id": task_request.user_id,  # Store user_id for memory generation
             "started_at": datetime.utcnow().isoformat(),
         }
 
@@ -193,6 +215,16 @@ async def run_task_async(task_id: str, task_agent, task_log_handler):
             "steps": len(result.action_names()),
         })
 
+        # Generate and store memories for successful task completion
+        task_data = active_tasks[task_id]
+        user_prompt = task_data.get("task", "")
+        task_result = result.final_result()
+        user_id = task_data.get("user_id", "")
+
+        if user_prompt and user_id:
+            # Run memory generation in background (don't await to avoid blocking)
+            asyncio.create_task(generate_and_store_memory(user_prompt, task_result, user_id))
+
     except Exception as e:
         # Update task with error info
         active_tasks[task_id].update({
@@ -206,6 +238,17 @@ async def run_task_async(task_id: str, task_agent, task_log_handler):
         browser_use_logger = logging.getLogger('browser_use')
         browser_use_logger.removeHandler(task_log_handler)
 
+        # Clean up browser instance
+        try:
+            task_browser = browser_instances.get(task_id)
+            if task_browser:
+                # Close the browser instance
+                await task_browser.close()
+                # Remove from instances dict
+                browser_instances.pop(task_id, None)
+        except Exception as cleanup_error:
+            print(f"Warning: Browser cleanup failed: {cleanup_error}")
+
         # Clean up log data after some time (optional)
         async def cleanup_logs():
             await asyncio.sleep(300)  # Keep logs for 5 minutes
@@ -213,6 +256,89 @@ async def run_task_async(task_id: str, task_agent, task_log_handler):
             log_listeners.pop(task_id, None)
 
         asyncio.create_task(cleanup_logs())
+
+async def generate_and_store_memory(user_prompt: str, task_result: str, user_id: str):
+    """
+    Generate personalization insights from user prompts and store them as memories.
+    Only creates memories when there are genuinely useful insights.
+    """
+    try:
+        # Create prompt for memory generation
+        memory_prompt = f"""
+        Analyze this user interaction and extract any useful personalization insights or preferences.
+        Only generate memories if there are genuine, useful insights about the user's behavior, preferences, or interests.
+        Don't create memories for generic or obvious actions.
+
+        User Prompt: "{user_prompt}"
+        Task Result: "{task_result[:500]}..."  # Truncate for analysis
+
+        Instructions:
+        - Look for user preferences, interests, habits, or patterns
+        - Examples: "User prefers news from specific sources", "User likes detailed technical explanations", "User frequently researches specific topics"
+        - Only include genuinely useful insights
+        - If no useful insights can be found, return an empty list
+        - Keep insights concise but meaningful
+        - Focus on long-term user preferences rather than one-off actions
+
+        Return ONLY a JSON array of memory strings, or an empty array [] if no useful insights:
+        """
+
+        # Generate memories using LLM
+        memory_response = await memory_llm.ainvoke(memory_prompt)
+        memory_text = memory_response.content.strip()
+
+        # Parse the JSON response
+        try:
+            memories_to_add = json.loads(memory_text)
+            if not isinstance(memories_to_add, list) or len(memories_to_add) == 0:
+                return  # No useful memories to add
+
+            # Filter out any empty or invalid memories
+            valid_memories = [mem for mem in memories_to_add if isinstance(mem, str) and mem.strip()]
+
+            if not valid_memories:
+                return  # No valid memories
+
+        except (json.JSONDecodeError, TypeError):
+            print(f"Failed to parse memory response: {memory_text}")
+            return
+
+        # Get or create user memories record
+        result = supabase.table('user_memories').select('memories').eq('user_id', user_id).execute()
+
+        existing_memories = []
+        record_id = None
+
+        if result.data and len(result.data) > 0:
+            # User has existing memories
+            existing_memories = result.data[0]['memories'] or []
+            record_id = result.data[0]['id']
+        else:
+            # Create new memories record for user
+            insert_result = supabase.table('user_memories').insert({
+                'user_id': user_id,
+                'memories': []
+            }).select().execute()
+            if insert_result.data:
+                record_id = insert_result.data[0]['id']
+
+        if record_id:
+            # Combine existing memories with new ones (avoid duplicates)
+            combined_memories = existing_memories.copy()
+            for new_memory in valid_memories:
+                if new_memory not in combined_memories:
+                    combined_memories.append(new_memory)
+
+            # Update the memories record
+            supabase.table('user_memories').update({
+                'memories': combined_memories
+            }).eq('id', record_id).execute()
+
+            print(f"Added {len(valid_memories)} new memories for user {user_id}: {valid_memories}")
+
+    except Exception as e:
+        print(f"Error generating/storing memories: {e}")
+        # Don't fail the main task if memory generation fails
 
 
 @app.get("/api/tasks/{task_id}", response_model=TaskStatusResponse)
