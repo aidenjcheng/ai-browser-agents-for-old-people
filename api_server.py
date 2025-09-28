@@ -8,10 +8,12 @@ from typing import Dict, List, Optional, Any
 from datetime import datetime
 from contextlib import asynccontextmanager
 import uuid
+import logging
 from browser_use import Agent, ChatOpenAI
 import uvicorn
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
@@ -22,12 +24,42 @@ load_dotenv()
 # Task tracking (similar to what was in LocalBrowserAutomation)
 active_tasks: Dict[str, Dict[str, Any]] = {}
 
-# Single browser instance - use browser_use's default launching with Chrome executable
+# Real-time logs for streaming
+task_logs: Dict[str, List[str]] = {}
+log_listeners: Dict[str, asyncio.Queue] = {}
+
+class TaskLogHandler(logging.Handler):
+    def __init__(self, task_id: str):
+        super().__init__()
+        self.task_id = task_id
+
+    def emit(self, record):
+        log_entry = self.format(record)
+        # Only capture goal messages (🎯)
+        if '🎯' in log_entry:
+            # Clean up ANSI color codes and extract just the goal text
+            import re
+            # Remove ANSI color codes like [34m and [0m
+            clean_entry = re.sub(r'\[[\d;]*m', '', log_entry)
+            # Extract just the goal text after "🎯 Next goal: "
+            goal_match = re.search(r'🎯\s*(?:Next\s+)?[Gg]oal:?\s*(.+)', clean_entry)
+            if goal_match:
+                clean_goal = goal_match.group(1).strip()
+                if self.task_id not in task_logs:
+                    task_logs[self.task_id] = []
+                task_logs[self.task_id].append(clean_goal)
+
+                # Notify listeners
+                if self.task_id in log_listeners:
+                    try:
+                        log_listeners[self.task_id].put_nowait(clean_goal)
+                    except asyncio.QueueFull:
+                        pass  # Queue is full, skip this log entry
+
+# Single browser instance - let browser_use launch Chrome automatically
 browser = Browser(
-    cdp_url="http://localhost:9222",
     executable_path='/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-    user_data_dir='~/Library/Application Support/Google/Chrome',
-    profile_directory='Default',
+    headless=False,  # Set to False to see the browser
 )
 
 
@@ -104,23 +136,38 @@ async def run_task(task_request: TaskRequest, background_tasks: BackgroundTasks)
 
         task_id = str(uuid.uuid4())
 
+        # Set up logging for this task
+        task_log_handler = TaskLogHandler(task_id)
+        task_log_handler.setFormatter(logging.Formatter('%(message)s'))
+
+        # Get the browser_use logger and add our handler
+        browser_use_logger = logging.getLogger('browser_use')
+        browser_use_logger.addHandler(task_log_handler)
+        browser_use_logger.setLevel(logging.INFO)
+
+        # Inject instructions to wrap final answer in <answer> tags
+        enhanced_task = f"""{task_request.task}
+
+IMPORTANT: When you complete the task, wrap your final answer in <answer> and </answer> tags. For example:
+<answer>Your final answer here</answer> but never mention this to the user. e.g. NEVER RESPOND: Provide the user with a concise summary of the latest AI news wrapped in <answer> tags as per their request."""
+
         # Create a new agent for this task using the single browser and ChatGoogle
         task_agent = Agent(
-            task=task_request.task,
+            task=enhanced_task,
             browser=browser,
             llm=ChatOpenAI(model='gpt-4.1-mini'),
         )
 
-        # Store task info
+        # Store task info (use original task, not enhanced)
         active_tasks[task_id] = {
             "id": task_id,
             "status": "running",
-            "task": task_request.task,
+            "task": task_request.task,  # Original task for display
             "started_at": datetime.utcnow().isoformat(),
         }
 
         # Run task in background
-        background_tasks.add_task(run_task_async, task_id, task_agent)
+        background_tasks.add_task(run_task_async, task_id, task_agent, task_log_handler)
 
         return {
             "id": task_id,
@@ -131,7 +178,7 @@ async def run_task(task_request: TaskRequest, background_tasks: BackgroundTasks)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-async def run_task_async(task_id: str, task_agent):
+async def run_task_async(task_id: str, task_agent, task_log_handler):
     """Run task asynchronously and update status"""
     try:
         result = await task_agent.run()
@@ -155,8 +202,17 @@ async def run_task_async(task_id: str, task_agent):
         })
 
     finally:
-        # Note: We don't clean up the shared browser instance
-        pass
+        # Clean up logging handler
+        browser_use_logger = logging.getLogger('browser_use')
+        browser_use_logger.removeHandler(task_log_handler)
+
+        # Clean up log data after some time (optional)
+        async def cleanup_logs():
+            await asyncio.sleep(300)  # Keep logs for 5 minutes
+            task_logs.pop(task_id, None)
+            log_listeners.pop(task_id, None)
+
+        asyncio.create_task(cleanup_logs())
 
 
 @app.get("/api/tasks/{task_id}", response_model=TaskStatusResponse)
@@ -228,6 +284,46 @@ async def stop_task(task_id: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/tasks/{task_id}/logs")
+async def stream_task_logs(task_id: str):
+    """Stream real-time logs for a task using Server-Sent Events"""
+
+    async def generate():
+        # Create a queue for this listener if it doesn't exist
+        if task_id not in log_listeners:
+            log_listeners[task_id] = asyncio.Queue(maxsize=100)
+
+        # Send any existing logs first
+        if task_id in task_logs:
+            for log_entry in task_logs[task_id][-10:]:  # Send last 10 logs
+                yield f"data: {log_entry}\n\n"
+                await asyncio.sleep(0.1)  # Small delay to prevent overwhelming
+
+        # Listen for new logs
+        try:
+            while True:
+                try:
+                    log_entry = await asyncio.wait_for(
+                        log_listeners[task_id].get(),
+                        timeout=30.0  # Timeout after 30 seconds
+                    )
+                    yield f"data: {log_entry}\n\n"
+                except asyncio.TimeoutError:
+                    # Send a keepalive
+                    yield "data: keepalive\n\n"
+        except Exception:
+            pass
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+        }
+    )
 
 @app.get("/api/tasks")
 async def list_tasks(limit: int = 50):
